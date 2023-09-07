@@ -7,7 +7,13 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.6.20", features = ["http2", "json", "macros", "matched-path", "multipart", "original-uri", "tokio", "tower-log", "form", "query"] }
+chrono = "0.4.29"
 hyper = { version = "0.14.27", features = ["full"] }
+serde = { version = "1.0.188", features = ["std", "derive"] }
+serde_json = "1.0.105"
 tokio = { version = "1.32.0", features = ["full"] }
 tower = "0.4.13"
-uuid = { version = "1.4.1", features = ["std", "v4"] }
+tower-http = { version = "0.4.4", features = ["trace"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
+uuid = { version = "1.4.1", features = ["std", "v4", "serde"] }
