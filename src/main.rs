@@ -1,6 +1,12 @@
 use axum::debug_handler;
 use axum::http::StatusCode;
-use axum::{extract::State, routing::get, routing::post, Json, Router};
+use axum::{
+    extract::{Path, State},
+    routing::delete,
+    routing::get,
+    routing::post,
+    Json, Router,
+};
 use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -115,8 +121,10 @@ async fn main() {
 
     // build our application with a router
     let app = Router::new()
-        .route("/", get(projects))
-        .route("/new", post(new_project))
+        .route("/projects/list", get(projects))
+        .route("/projects/new", post(new_project))
+        .route("/projects/:id", get(get_project))
+        .route("/projects/:id", delete(delete_project))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -255,5 +263,80 @@ async fn new_project(
                 }
             }
         }
+    }
+}
+
+#[debug_handler]
+async fn get_project(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Path(id): Path<Uuid>,
+) -> (StatusCode, Json<Value>) {
+    let mut state = state.lock().await;
+    let project_path = state.get_path().join(id.to_string());
+    if project_path.exists() {
+        let config = tokio::fs::read_to_string(project_path.join("project.json")).await;
+        match config {
+            Ok(config) => {
+                let project = serde_json::from_str::<Project>(&config);
+                match project {
+                    Ok(project) => (StatusCode::OK, Json(json!(project))),
+                    Err(_) => {
+                        tracing::error!("Error parsing project.json for {}", id);
+                        state.remove(&id).await;
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": "Internal server error"})),
+                        )
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::error!("Error reading project.json for {}", id);
+                state.remove(&id).await;
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Internal server error"})),
+                )
+            }
+        }
+    } else {
+        tracing::error!("Project {} does not exist", id);
+        state.remove(&id).await;
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Project does not exist"})),
+        )
+    }
+}
+
+#[debug_handler]
+async fn delete_project(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Path(id): Path<Uuid>,
+) -> (StatusCode, Json<Value>) {
+    let mut state = state.lock().await;
+    let project_path = state.get_path().join(id.to_string());
+    if project_path.exists() {
+        let remove = remove_dir_all(project_path.clone()).await;
+        match remove {
+            Ok(_) => {
+                state.remove(&id).await;
+                (StatusCode::OK, Json(json!({})))
+            }
+            Err(_) => {
+                tracing::error!("Error removing project {}", id);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Internal server error"})),
+                )
+            }
+        }
+    } else {
+        tracing::error!("Project {} does not exist", id);
+        state.remove(&id).await;
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Project does not exist"})),
+        )
     }
 }
