@@ -6,12 +6,16 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-axum = { version = "0.6.20", features = ["http2", "json", "macros", "matched-path", "multipart", "original-uri", "tokio", "tower-log", "form", "query"] }
+axum = { version = "0.6.20", features = ["http2", "json", "macros", "matched-path", "multipart", "original-uri", "tokio", "tower-log", "form", "query", "headers"] }
 chrono = "0.4.29"
 hyper = { version = "0.14.27", features = ["full"] }
+mime_guess = "2.0.4"
+openssl = "0.10.57"
 serde = { version = "1.0.188", features = ["std", "derive"] }
 serde_json = "1.0.105"
+sha256 = { version = "1.4.0", features = ["tokio", "native_openssl"] }
 tokio = { version = "1.32.0", features = ["full"] }
+tokio-util = { version = "0.7.8", features = ["full"] }
 tower = "0.4.13"
 tower-http = { version = "0.4.4", features = ["trace"] }
 tracing = "0.1.37"
