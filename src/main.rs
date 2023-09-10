@@ -12,6 +12,7 @@ use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::fs::Metadata;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{create_dir, remove_dir_all};
@@ -233,10 +234,29 @@ async fn projects(State(state): State<Arc<Mutex<AppState>>>) -> Json<Vec<Project
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+enum Model {
+    LinearRegression,
+    LogisticRegression,
+    RandomForest,
+    DecisionTree,
+    SVM,
+    KNN,
+    KMeans,
+    PCA,
+    TSNE,
+    UMAP,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 struct DataHandle {
     name: String,
     size: u64,
-    pre_cleaned: bool,
+    content_type: String,
+    shape: (u64, u64),
+    features: Vec<String>,
+    target: String,
+    head: Vec<Vec<String>>,
+    models: Vec<Model>,
 }
 
 impl Default for DataHandle {
@@ -244,18 +264,51 @@ impl Default for DataHandle {
         Self {
             name: String::new(),
             size: 0,
-            pre_cleaned: false,
+            content_type: String::new(),
+            shape: (0, 0),
+            features: Vec::new(),
+            target: String::new(),
+            head: Vec::new(),
+            models: Vec::new(),
         }
     }
 }
 
 impl DataHandle {
-    fn new(name: String, size: u64, pre_cleaned: bool) -> Self {
-        Self {
-            name,
-            size,
-            pre_cleaned,
-        }
+    fn new(path: &PathBuf, metadata: &Metadata, content_type: &str, target: &str) -> Self {
+        let mut data_handle = Self::default();
+
+        let mut csv_file = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_path(path)
+            .unwrap();
+        let records = csv_file
+            .records()
+            .filter_map(|record| record.ok())
+            .collect::<Vec<_>>();
+
+        data_handle.name = path.file_name().unwrap().to_str().unwrap().to_string();
+        data_handle.size = metadata.len();
+        data_handle.content_type = content_type.to_string();
+        data_handle.shape = (
+            records.len() as u64,
+            csv_file.headers().unwrap().len() as u64 - 1,
+        );
+        data_handle.features = csv_file
+            .headers()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_string())
+            .filter(|s| s != target)
+            .collect();
+        data_handle.target = target.to_string();
+        data_handle.head = records
+            .into_iter()
+            .take(5)
+            .map(|record| record.iter().map(|s| s.to_string()).collect())
+            .collect();
+        data_handle.models = Vec::new();
+        data_handle
     }
 }
 
@@ -433,41 +486,66 @@ async fn new_data(
                     Err(_) => HashMap::new(),
                 };
 
-            if let Some(field) = payload.next_field().await.unwrap() {
-                let name = field.name().unwrap().to_string();
-                let data = field.bytes().await.unwrap();
-                if name.is_empty() {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": "No name provided" })),
-                    );
+            let mut fields = Vec::new();
+            while let Some(field) = payload.next_field().await.unwrap() {
+                let name = field.name().unwrap_or_default().to_string();
+                if name == "data" {
+                    let file_name = field.file_name().unwrap_or_default().to_string();
+                    let content_type = field.content_type().unwrap_or_default().to_string();
+                    let data = field.bytes().await.unwrap();
+                    fields.push((file_name, content_type, data));
+                } else if name == "target" {
+                    fields.push((
+                        "target".to_string(),
+                        "".to_string(),
+                        field.bytes().await.unwrap(),
+                    ));
                 }
-                let path = project_path.join(&name);
-                tokio::fs::write(&path, data).await.unwrap();
-
-                let metadata = tokio::fs::metadata(project_path.join(&name)).await.unwrap();
-                let data_handle = DataHandle::new(name, metadata.len(), false);
-
-                let hash = sha256::async_calc(
-                    BufReader::new(tokio::fs::File::open(&path).await.unwrap()),
-                    openssl::sha::Sha256::new(),
-                )
-                .await
-                .unwrap();
-                data_handles.insert(hash.clone(), data_handle);
-                tokio::fs::write(
-                    project_path.join("data.json"),
-                    serde_json::to_string(&data_handles).unwrap(),
-                )
-                .await
-                .unwrap();
-
-                (StatusCode::CREATED, Json(json!(hash)))
-            } else {
+            }
+            if fields.len() != 2 {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "No data provided" })),
+                    Json(json!({ "error": "Invalid number of fields", "fields": fields.len() })),
                 );
+            }
+
+            if let Some(file) = fields.iter().find(|field| field.0 != "target") {
+                let name = file.0.clone();
+                let content_type = file.1.clone();
+                let data = file.2.clone();
+
+                let hash =
+                    sha256::async_calc(BufReader::new(data.as_ref()), openssl::sha::Sha256::new())
+                        .await
+                        .unwrap();
+
+                if data_handles.contains_key(&hash) {
+                    (StatusCode::FOUND, Json(json!(hash)))
+                } else {
+                    let path = project_path.join(&name);
+                    tokio::fs::write(&path, data).await.unwrap();
+                    let metadata = tokio::fs::metadata(project_path.join(&name)).await.unwrap();
+                    let data_handle = DataHandle::new(
+                        &path,
+                        &metadata,
+                        &content_type,
+                        std::str::from_utf8(
+                            &fields.iter().find(|field| field.0 == "target").unwrap().2,
+                        )
+                        .unwrap(),
+                    );
+                    data_handles.insert(hash.clone(), data_handle);
+                    let data_file = serde_json::to_string(&data_handles).unwrap();
+                    tokio::fs::write(project_path.join("data.json"), data_file)
+                        .await
+                        .unwrap();
+                    (StatusCode::CREATED, Json(json!(hash)))
+                }
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "Invalid data field" })),
+                )
             }
         }
         Err(err) => {
