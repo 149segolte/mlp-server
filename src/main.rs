@@ -1,111 +1,35 @@
-use axum::body::StreamBody;
-use axum::debug_handler;
-use axum::extract::Multipart;
-use axum::response::{IntoResponse, Response};
 use axum::{
-    extract::{Path, State},
-    http::{header, StatusCode},
-    routing::{delete, get, post},
+    body::StreamBody,
+    debug_handler,
+    extract::{Multipart, Path, State},
+    http::{header, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
     Json, Router,
 };
 use chrono::prelude::*;
-use serde::{Deserialize, Serialize};
+use clap::Parser;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::fs::Metadata;
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::fs::{create_dir, remove_dir_all};
 use tokio::io::BufReader;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize, Clone)]
-struct AppState {
-    server_path: PathBuf,
+pub mod types;
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[clap(short, long, default_value = "8080")]
     port: u16,
-    projects: HashSet<Uuid>,
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        AppState {
-            server_path: PathBuf::new(),
-            port: 3000,
-            projects: HashSet::new(),
-        }
-    }
-}
-
-impl AppState {
-    async fn new(server_path: PathBuf) -> Self {
-        let mut state = AppState {
-            server_path,
-            ..Default::default()
-        };
-
-        if state.server_path.join("config.json").exists() {
-            state.load().await.unwrap();
-        } else {
-            state.write().await.unwrap();
-        }
-
-        state
-    }
-
-    async fn write(&self) -> tokio::io::Result<()> {
-        tokio::fs::write(
-            self.server_path.join("config.json"),
-            serde_json::to_string(&self).unwrap(),
-        )
-        .await
-    }
-
-    async fn load(&mut self) -> tokio::io::Result<()> {
-        let config = tokio::fs::read_to_string(self.server_path.join("config.json")).await?;
-        let config: AppState = serde_json::from_str(&config).unwrap();
-        self.server_path = config.server_path;
-        self.projects = config.projects;
-        self.port = config.port;
-        Ok(())
-    }
-
-    fn get_path(&self) -> PathBuf {
-        self.server_path.clone()
-    }
-
-    fn get_port(&self) -> u16 {
-        self.port
-    }
-
-    async fn set_port(&mut self, port: u16) {
-        self.port = port;
-        self.write().await.unwrap();
-    }
-
-    fn get_projects(&self) -> HashSet<Uuid> {
-        self.projects.clone()
-    }
-
-    async fn add(&mut self, id: Uuid) {
-        self.projects.insert(id);
-        self.write().await.unwrap();
-    }
-
-    async fn remove(&mut self, id: &Uuid) {
-        self.projects.remove(id);
-        self.write().await.unwrap();
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Project {
-    id: Uuid,
-    name: String,
-    description: String,
-    expires: i64,
+    #[clap(short, long, default_value = "/")]
+    route: String,
 }
 
 #[tokio::main]
@@ -115,35 +39,53 @@ async fn main() {
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
+    // get args
+    let args = Args::parse();
+
     // create State
     let path = std::env::current_dir().unwrap().join(".server");
     if !path.exists() {
         create_dir(&path).await.unwrap();
     }
-    let state = Arc::new(Mutex::new(AppState::new(path).await));
-    let port = state.lock().await.get_port();
+    let state = Arc::new(Mutex::new(types::AppState::new(path).await));
+
+    // create cors layer
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE])
+        .allow_origin(Any);
 
     // build our application with a router
+    let data = Router::new()
+        .route("/", get(get_datahandle).delete(delete_datahandle))
+        .route("/file", get(get_data));
+
+    let project = Router::new()
+        .route("/", get(project_info).delete(delete_project))
+        .route("/upload", post(upload_data))
+        .nest("/:hash", data);
+
     let app = Router::new()
-        .route("/projects/list", get(projects))
-        .route("/projects/new", post(new_project))
-        .route("/projects/:id", get(get_project))
-        .route("/projects/:id", delete(delete_project))
-        .route("/projects/:id/new", post(new_data))
-        .route("/projects/:id/:hash", get(get_datahandle))
-        .route("/projects/:id/:hash", delete(delete_datahandle))
-        .route("/projects/:id/:hash/file", get(get_data))
+        .route("/projects", get(projects_list))
+        .route("/project", post(new_project))
+        .nest("/project/:id", project);
+
+    // run it on localhost
+    let routing = Router::new()
+        .nest(&args.route, app)
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
-
-    // run it with hyper on localhost
-    let addr = ([127, 0, 0, 1], port).into();
+    let addr = format!("[::]:{}", args.port).parse().unwrap();
     let server = axum::Server::bind(&addr);
     tracing::debug!("Listening on {}", addr);
-    server.serve(app.into_make_service()).await.unwrap();
+    server.serve(routing.into_make_service()).await.unwrap();
 }
 
-async fn validate_project(state: Arc<Mutex<AppState>>, id: Uuid) -> Result<Project, &'static str> {
+async fn validate_project(
+    state: Arc<Mutex<types::AppState>>,
+    id: Uuid,
+) -> Result<types::Project, &'static str> {
     let state = state.lock().await;
     if !state.get_projects().contains(&id) {
         return Err("Project not found in config");
@@ -155,11 +97,11 @@ async fn validate_project(state: Arc<Mutex<AppState>>, id: Uuid) -> Result<Proje
     let config = tokio::fs::read_to_string(project_path.join("project.json")).await;
     match config {
         Ok(config) => {
-            let project = serde_json::from_str::<Project>(&config);
+            let project = serde_json::from_str::<types::Project>(&config);
             match project {
                 Ok(project) => {
                     let now = Utc::now().timestamp();
-                    if project.expires < now {
+                    if project.get_expires() < now {
                         return Err("Project has expired");
                     }
                     Ok(project.clone())
@@ -171,7 +113,7 @@ async fn validate_project(state: Arc<Mutex<AppState>>, id: Uuid) -> Result<Proje
     }
 }
 
-async fn remove_project(state: Arc<Mutex<AppState>>, id: Uuid) {
+async fn remove_project(state: Arc<Mutex<types::AppState>>, id: Uuid) {
     let mut state = state.lock().await;
     state.remove(&id).await;
     let project_path = state.get_path().join(id.to_string());
@@ -180,44 +122,41 @@ async fn remove_project(state: Arc<Mutex<AppState>>, id: Uuid) {
     }
 }
 
-#[derive(Deserialize)]
-struct NewProject {
-    name: String,
-    description: String,
-}
-
 #[debug_handler]
 async fn new_project(
-    State(state): State<Arc<Mutex<AppState>>>,
-    Json(new): Json<NewProject>,
+    State(state): State<Arc<Mutex<types::AppState>>>,
+    Json(new): Json<Value>,
 ) -> (StatusCode, Json<Uuid>) {
-    if new.name.is_empty() {
+    if new.get("name").is_none() {
         return (StatusCode::BAD_REQUEST, Json(Uuid::nil()));
     }
-    if new.description.is_empty() {
+    if new.get("description").is_none() {
         return (StatusCode::BAD_REQUEST, Json(Uuid::nil()));
     }
-    let id = Uuid::new_v4();
-    remove_project(state.clone(), id).await;
+    let project = types::Project::new(
+        new.get("name").unwrap().as_str().unwrap().to_string(),
+        new.get("description")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string(),
+        Utc::now().timestamp() + 60 * 60 * 24,
+    );
     let mut state = state.lock().await;
-    let project_path = state.get_path().join(id.to_string());
+    let project_path = state.get_path().join(project.get_id().to_string());
     create_dir(&project_path).await.unwrap();
-    let project = Project {
-        id,
-        name: new.name,
-        description: new.description,
-        expires: Utc::now().timestamp() + 60 * 60 * 24,
-    };
     let project_json = serde_json::to_string(&project).unwrap();
     tokio::fs::write(project_path.join("project.json"), project_json)
         .await
         .unwrap();
-    state.add(id).await;
-    (StatusCode::CREATED, Json(id))
+    state.add(project.get_id()).await;
+    (StatusCode::CREATED, Json(project.get_id()))
 }
 
 #[debug_handler]
-async fn projects(State(state): State<Arc<Mutex<AppState>>>) -> Json<Vec<Project>> {
+async fn projects_list(
+    State(state): State<Arc<Mutex<types::AppState>>>,
+) -> Json<Vec<types::Project>> {
     let mut projects = Vec::new();
     let uuids = state.lock().await.get_projects();
     for id in uuids.iter() {
@@ -233,88 +172,9 @@ async fn projects(State(state): State<Arc<Mutex<AppState>>>) -> Json<Vec<Project
     Json(projects)
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-enum Model {
-    LinearRegression,
-    LogisticRegression,
-    RandomForest,
-    DecisionTree,
-    SVM,
-    KNN,
-    KMeans,
-    PCA,
-    TSNE,
-    UMAP,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct DataHandle {
-    name: String,
-    size: u64,
-    content_type: String,
-    shape: (u64, u64),
-    features: Vec<String>,
-    target: String,
-    head: Vec<Vec<String>>,
-    models: Vec<Model>,
-}
-
-impl Default for DataHandle {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            size: 0,
-            content_type: String::new(),
-            shape: (0, 0),
-            features: Vec::new(),
-            target: String::new(),
-            head: Vec::new(),
-            models: Vec::new(),
-        }
-    }
-}
-
-impl DataHandle {
-    fn new(path: &PathBuf, metadata: &Metadata, content_type: &str, target: &str) -> Self {
-        let mut data_handle = Self::default();
-
-        let mut csv_file = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .from_path(path)
-            .unwrap();
-        let records = csv_file
-            .records()
-            .filter_map(|record| record.ok())
-            .collect::<Vec<_>>();
-
-        data_handle.name = path.file_name().unwrap().to_str().unwrap().to_string();
-        data_handle.size = metadata.len();
-        data_handle.content_type = content_type.to_string();
-        data_handle.shape = (
-            records.len() as u64,
-            csv_file.headers().unwrap().len() as u64 - 1,
-        );
-        data_handle.features = csv_file
-            .headers()
-            .unwrap()
-            .iter()
-            .map(|s| s.to_string())
-            .filter(|s| s != target)
-            .collect();
-        data_handle.target = target.to_string();
-        data_handle.head = records
-            .into_iter()
-            .take(5)
-            .map(|record| record.iter().map(|s| s.to_string()).collect())
-            .collect();
-        data_handle.models = Vec::new();
-        data_handle
-    }
-}
-
 #[debug_handler]
-async fn get_project(
-    State(state): State<Arc<Mutex<AppState>>>,
+async fn project_info(
+    State(state): State<Arc<Mutex<types::AppState>>>,
     Path(id): Path<Uuid>,
 ) -> (StatusCode, Json<Value>) {
     let project = validate_project(state.clone(), id).await;
@@ -324,7 +184,7 @@ async fn get_project(
             let data_file = tokio::fs::read_to_string(project_path.join("data.json")).await;
             let data_handles = match data_file {
                 Ok(file) => {
-                    let data = serde_json::from_str::<HashMap<String, DataHandle>>(&file);
+                    let data = serde_json::from_str::<HashMap<String, types::DataHandle>>(&file);
                     match data {
                         Ok(data_handles) => data_handles,
                         Err(_) => {
@@ -340,10 +200,10 @@ async fn get_project(
             (
                 StatusCode::OK,
                 Json(json!({
-                    "id": project.id,
-                    "name": project.name,
-                    "description": project.description,
-                    "expires": project.expires,
+                    "id": project.get_id(),
+                    "name": project.get_name(),
+                    "description": project.get_description(),
+                    "expires": project.get_expires(),
                     "data": data_handles,
                 })),
             )
@@ -358,7 +218,7 @@ async fn get_project(
 
 #[debug_handler]
 async fn delete_project(
-    State(state): State<Arc<Mutex<AppState>>>,
+    State(state): State<Arc<Mutex<types::AppState>>>,
     Path(id): Path<Uuid>,
 ) -> (StatusCode, Json<Value>) {
     remove_project(state.clone(), id).await;
@@ -366,10 +226,10 @@ async fn delete_project(
 }
 
 async fn validate_datahandle(
-    state: Arc<Mutex<AppState>>,
+    state: Arc<Mutex<types::AppState>>,
     id: Uuid,
     hash: String,
-) -> Result<DataHandle, &'static str> {
+) -> Result<types::DataHandle, &'static str> {
     let project = validate_project(state.clone(), id).await;
     match project {
         Ok(_) => {
@@ -377,13 +237,14 @@ async fn validate_datahandle(
             let data_file = tokio::fs::read_to_string(project_path.join("data.json")).await;
             match data_file {
                 Ok(file) => {
-                    let data_handle = serde_json::from_str::<HashMap<String, DataHandle>>(&file);
+                    let data_handle =
+                        serde_json::from_str::<HashMap<String, types::DataHandle>>(&file);
                     match data_handle {
                         Ok(data_handle) => {
                             if data_handle.contains_key(&hash) {
                                 let data = data_handle.get(&hash).unwrap();
                                 let reader = BufReader::new(
-                                    tokio::fs::File::open(project_path.join(&data.name))
+                                    tokio::fs::File::open(project_path.join(&data.get_name()))
                                         .await
                                         .unwrap(),
                                 );
@@ -415,7 +276,7 @@ async fn validate_datahandle(
 }
 
 async fn remove_datahandle(
-    state: Arc<Mutex<AppState>>,
+    state: Arc<Mutex<types::AppState>>,
     id: Uuid,
     hash: String,
 ) -> Result<(), &'static str> {
@@ -424,7 +285,7 @@ async fn remove_datahandle(
     if project_path.exists() {
         let mut data_file = match tokio::fs::read_to_string(project_path.join("data.json")).await {
             Ok(file) => {
-                let data = serde_json::from_str::<HashMap<String, DataHandle>>(&file);
+                let data = serde_json::from_str::<HashMap<String, types::DataHandle>>(&file);
                 match data {
                     Ok(data) => data,
                     Err(_) => {
@@ -440,7 +301,7 @@ async fn remove_datahandle(
         };
         if data_file.contains_key(&hash) {
             let data = data_file.get(&hash).unwrap();
-            tokio::fs::remove_file(project_path.join(&data.name))
+            tokio::fs::remove_file(project_path.join(&data.get_name()))
                 .await
                 .unwrap();
             data_file.remove(&hash);
@@ -460,8 +321,8 @@ async fn remove_datahandle(
 }
 
 #[debug_handler]
-async fn new_data(
-    State(state): State<Arc<Mutex<AppState>>>,
+async fn upload_data(
+    State(state): State<Arc<Mutex<types::AppState>>>,
     Path(id): Path<Uuid>,
     mut payload: Multipart,
 ) -> (StatusCode, Json<Value>) {
@@ -469,22 +330,23 @@ async fn new_data(
     match project {
         Ok(_) => {
             let project_path = state.lock().await.get_path().join(id.to_string());
-            let mut data_handles =
-                match tokio::fs::read_to_string(project_path.join("data.json")).await {
-                    Ok(file) => {
-                        let data = serde_json::from_str::<HashMap<String, DataHandle>>(&file);
-                        match data {
-                            Ok(data) => data,
-                            Err(_) => {
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(json!({ "error": "Error parsing data.json" })),
-                                )
-                            }
+            let mut data_handles = match tokio::fs::read_to_string(project_path.join("data.json"))
+                .await
+            {
+                Ok(file) => {
+                    let data = serde_json::from_str::<HashMap<String, types::DataHandle>>(&file);
+                    match data {
+                        Ok(data) => data,
+                        Err(_) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({ "error": "Error parsing data.json" })),
+                            )
                         }
                     }
-                    Err(_) => HashMap::new(),
-                };
+                }
+                Err(_) => HashMap::new(),
+            };
 
             let mut fields = Vec::new();
             while let Some(field) = payload.next_field().await.unwrap() {
@@ -525,7 +387,7 @@ async fn new_data(
                     let path = project_path.join(&name);
                     tokio::fs::write(&path, data).await.unwrap();
                     let metadata = tokio::fs::metadata(project_path.join(&name)).await.unwrap();
-                    let data_handle = DataHandle::new(
+                    let data_handle = types::DataHandle::new(
                         &path,
                         &metadata,
                         &content_type,
@@ -558,7 +420,7 @@ async fn new_data(
 
 #[debug_handler]
 async fn get_datahandle(
-    State(state): State<Arc<Mutex<AppState>>>,
+    State(state): State<Arc<Mutex<types::AppState>>>,
     Path((id, hash)): Path<(Uuid, String)>,
 ) -> (StatusCode, Json<Value>) {
     let datahandle = validate_datahandle(state.clone(), id, hash).await;
@@ -570,7 +432,7 @@ async fn get_datahandle(
 
 #[debug_handler]
 async fn delete_datahandle(
-    State(state): State<Arc<Mutex<AppState>>>,
+    State(state): State<Arc<Mutex<types::AppState>>>,
     Path((id, hash)): Path<(Uuid, String)>,
 ) -> (StatusCode, Json<Value>) {
     let datahandle = remove_datahandle(state.clone(), id, hash).await;
@@ -582,7 +444,7 @@ async fn delete_datahandle(
 
 #[debug_handler]
 async fn get_data(
-    State(state): State<Arc<Mutex<AppState>>>,
+    State(state): State<Arc<Mutex<types::AppState>>>,
     Path((id, hash)): Path<(Uuid, String)>,
 ) -> Response {
     let datahandle = match validate_datahandle(state.clone(), id, hash).await {
@@ -596,7 +458,7 @@ async fn get_data(
         .await
         .get_path()
         .join(id.to_string())
-        .join(&datahandle.name);
+        .join(&datahandle.get_name());
     let file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(err) => {
