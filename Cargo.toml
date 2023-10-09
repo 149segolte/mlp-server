@@ -7,11 +7,16 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.6.20", features = ["http2", "json", "macros", "matched-path", "multipart", "original-uri", "tokio", "tower-log", "form", "query", "headers"] }
+bincode = "1.3.3"
 chrono = "0.4.29"
 clap = { version = "4.4.6", features = ["derive"] }
 csv = "1.2.2"
 hyper = { version = "0.14.27", features = ["full"] }
+linfa = { version = "0.6.1", features = ["serde", "ndarray-linalg", "blas", "openblas-system"] }
+linfa-linear = { version = "0.6.1", features = ["ndarray-linalg"] }
 mime_guess = "2.0.4"
+ndarray = { version = "0.15.6", features = ["serde", "rayon", "matrixmultiply-threading", "blas"]}
+ndarray-csv = "0.5.2"
 openssl = "0.10.57"
 serde = { version = "1.0.188", features = ["std", "derive"] }
 serde_json = "1.0.105"

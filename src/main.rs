@@ -40,13 +40,43 @@ async fn main() {
     // get args
     let args = Args::parse();
 
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
     // create State
     let path = std::env::current_dir().unwrap().join(".server");
     if !path.exists() {
         create_dir(&path).await.unwrap();
     }
-    let state = Arc::new(Mutex::new(types::AppState::new(path).await));
+    let state = Arc::new(Mutex::new(types::AppState::new(path, tx.clone()).await));
 
+    // setup model build queue
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let state_clone = state_clone.clone();
+        while let Some((id, hash, model_config)) = rx.recv().await {
+            let state = state_clone.lock().await;
+            let project = state.get_project(&id).is_some();
+            if !project {
+                tracing::error!("Project {} not found", id);
+                continue;
+            }
+            let datahandle = state
+                .get_project(&id)
+                .unwrap()
+                .get_datahandle(&hash)
+                .is_some();
+            if !datahandle {
+                tracing::error!("Datahandle {} not found", hash);
+                continue;
+            }
+            drop(state);
+            tracing::info!("Building model {} for project {}", model_config.name, id);
+            let model = types::Model::new(state_clone.clone(), id, &hash, model_config).await;
+            let mut state = state_clone.lock().await;
+            state.add_model(id, model).await;
+        }
+    });
+    //
     // create cors layer
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
@@ -56,12 +86,20 @@ async fn main() {
     // build our application with a router
     let data = Router::new()
         .route("/", get(get_datahandle).delete(delete_datahandle))
-        .route("/file", get(get_data));
+        .route("/file", get(get_data))
+        .route("/models", get(get_models))
+        .route("/add", post(add_model));
+
+    let model = Router::new()
+        .route("/", get(get_model).delete(delete_model))
+        .route("/metrics", get(get_model_metrics))
+        .route("/file", get(get_model_file));
 
     let project = Router::new()
         .route("/", get(project_info).delete(delete_project))
         .route("/upload", post(upload_data))
-        .nest("/:hash", data);
+        .nest("/data/:hash", data)
+        .nest("/model/:model", model);
 
     let app = Router::new()
         .route("/projects", get(projects_list))
@@ -132,7 +170,15 @@ async fn project_info(
     let state = state.lock().await;
     let project = state.get_project(&id);
     match project {
-        Some(project) => (StatusCode::OK, Json(project.get_info())),
+        Some(project) => (
+            StatusCode::OK,
+            Json(json!({
+                "name": project.get_name(),
+                "description": project.get_description(),
+                "expires": project.get_expires(),
+                "data": project.get_datahandles().iter().map(|d| d.get_info()).collect::<Vec<_>>()
+            })),
+        ),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Project not found" })),
@@ -311,6 +357,178 @@ async fn get_data(
                 None => (
                     StatusCode::NOT_FOUND,
                     serde_json::to_string(&json!({ "error": "Data not found" })).unwrap(),
+                )
+                    .into_response(),
+            }
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            serde_json::to_string(&json!({ "error": "Project not found" })).unwrap(),
+        )
+            .into_response(),
+    }
+}
+
+#[debug_handler]
+async fn get_models(
+    State(state): State<Arc<Mutex<types::AppState>>>,
+    Path((id, hash)): Path<(Uuid, String)>,
+) -> (StatusCode, Json<Value>) {
+    let state = state.lock().await;
+    let project = state.get_project(&id);
+    match project {
+        Some(project) => {
+            let models = project
+                .get_models(&hash)
+                .iter()
+                .map(|model| model.get_info())
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(json!({ "models": models })))
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Project not found" })),
+        ),
+    }
+}
+
+#[debug_handler]
+async fn add_model(
+    State(state): State<Arc<Mutex<types::AppState>>>,
+    Path((id, hash)): Path<(Uuid, String)>,
+    Json(config): Json<types::ModelConfig>,
+) -> (StatusCode, Json<Value>) {
+    let state = state.lock().await;
+    let project = state.get_project(&id).is_some();
+    if project {
+        let datahandle = state
+            .get_project(&id)
+            .unwrap()
+            .get_datahandle(&hash)
+            .is_some();
+        if !datahandle {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Data not found" })),
+            );
+        }
+        state.add_model_queue(id, &hash, config).await;
+        (
+            StatusCode::CREATED,
+            Json(json!({ "status": "Added to queue" })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Project not found" })),
+        )
+    }
+}
+
+#[debug_handler]
+async fn get_model(
+    State(state): State<Arc<Mutex<types::AppState>>>,
+    Path((id, model_id)): Path<(Uuid, Uuid)>,
+) -> (StatusCode, Json<Value>) {
+    let state = state.lock().await;
+    let project = state.get_project(&id);
+    match project {
+        Some(project) => {
+            let model = project.get_model(model_id);
+            match model {
+                Some(model) => (StatusCode::OK, Json(model.get_overview().await)),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Model not found" })),
+                ),
+            }
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Project not found" })),
+        ),
+    }
+}
+
+#[debug_handler]
+async fn delete_model(
+    State(state): State<Arc<Mutex<types::AppState>>>,
+    Path((id, model_id)): Path<(Uuid, Uuid)>,
+) -> StatusCode {
+    let mut state = state.lock().await;
+    state.remove_model(id, model_id).await;
+    StatusCode::OK
+}
+
+#[debug_handler]
+async fn get_model_metrics(
+    State(state): State<Arc<Mutex<types::AppState>>>,
+    Path((id, model_id)): Path<(Uuid, Uuid)>,
+) -> (StatusCode, Json<Value>) {
+    let state = state.lock().await;
+    let project = state.get_project(&id);
+    match project {
+        Some(project) => {
+            let model = project.get_model(model_id);
+            match model {
+                Some(model) => (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(model.get_metrics()).unwrap()),
+                ),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Model not found" })),
+                ),
+            }
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Project not found" })),
+        ),
+    }
+}
+
+#[debug_handler]
+async fn get_model_file(
+    State(state): State<Arc<Mutex<types::AppState>>>,
+    Path((id, model_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    let state = state.lock().await;
+    let project = state.get_project(&id);
+    match project {
+        Some(project) => {
+            let model = project.get_model(model_id);
+            match model {
+                Some(model) => {
+                    let file = match tokio::fs::File::open(model.get_path().join("model.bin")).await
+                    {
+                        Ok(file) => file,
+                        Err(err) => {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                serde_json::to_string(&json!({ "error": err.to_string() }))
+                                    .unwrap(),
+                            )
+                                .into_response()
+                        }
+                    };
+                    let stream = ReaderStream::new(file);
+                    let body = StreamBody::new(stream);
+                    let content_type = "application/octet-stream";
+
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, content_type),
+                            (header::CONTENT_DISPOSITION, model.get_name().as_str()),
+                        ],
+                        body,
+                    )
+                        .into_response()
+                }
+                None => (
+                    StatusCode::NOT_FOUND,
+                    serde_json::to_string(&json!({ "error": "Model not found" })).unwrap(),
                 )
                     .into_response(),
             }
