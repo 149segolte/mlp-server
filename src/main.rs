@@ -92,12 +92,13 @@ async fn main() {
 
     let model = Router::new()
         .route("/", get(get_model).delete(delete_model))
+        .route("/predict", get(model_predict))
         .route("/metrics", get(get_model_metrics))
         .route("/file", get(get_model_file));
 
     let project = Router::new()
         .route("/", get(project_info).delete(delete_project))
-        .route("/upload", post(upload_data))
+        .route("/data", post(upload_data))
         .nest("/data/:hash", data)
         .nest("/model/:model", model);
 
@@ -396,27 +397,33 @@ async fn get_models(
 async fn add_model(
     State(state): State<Arc<Mutex<types::AppState>>>,
     Path((id, hash)): Path<(Uuid, String)>,
-    Json(config): Json<types::ModelConfig>,
+    Json(config): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let state = state.lock().await;
     let project = state.get_project(&id).is_some();
     if project {
-        let datahandle = state
-            .get_project(&id)
-            .unwrap()
-            .get_datahandle(&hash)
-            .is_some();
-        if !datahandle {
-            return (
+        match state.get_project(&id).unwrap().get_datahandle(&hash) {
+            Some(datahandle) => {
+                let config = match types::ModelConfig::from_json(datahandle, &config) {
+                    Ok(config) => config,
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": err.to_string() })),
+                        )
+                    }
+                };
+                state.add_model_queue(id, &hash, config).await;
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "status": "Added to queue" })),
+                )
+            }
+            None => (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "Data not found" })),
-            );
+            ),
         }
-        state.add_model_queue(id, &hash, config).await;
-        (
-            StatusCode::CREATED,
-            Json(json!({ "status": "Added to queue" })),
-        )
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -458,6 +465,50 @@ async fn delete_model(
     let mut state = state.lock().await;
     state.remove_model(id, model_id).await;
     StatusCode::OK
+}
+
+#[debug_handler]
+async fn model_predict(
+    State(state): State<Arc<Mutex<types::AppState>>>,
+    Path((id, model_id)): Path<(Uuid, Uuid)>,
+    Json(data): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let state = state.lock().await;
+    let project = state.get_project(&id);
+    match project {
+        Some(project) => {
+            let model = project.get_model(model_id);
+            match model {
+                Some(model) => {
+                    let input = match data.get("input") {
+                        Some(input) => input,
+                        None => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({ "error": "Missing input" })),
+                            )
+                        }
+                    };
+                    let data: Vec<Vec<f32>> = serde_json::from_value(input.clone()).unwrap();
+                    let data = ndarray::Array::from_shape_vec(
+                        (data.len(), data[0].len()),
+                        data.into_iter().flatten().collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                    let res = model.predict(&data);
+                    (StatusCode::OK, Json(serde_json::to_value(res).unwrap()))
+                }
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Model not found" })),
+                ),
+            }
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Project not found" })),
+        ),
+    }
 }
 
 #[debug_handler]

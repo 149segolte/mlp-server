@@ -14,8 +14,9 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
-use tokio::fs::{create_dir, create_dir_all};
+use tokio::fs::{create_dir, create_dir_all, remove_file};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -25,14 +26,14 @@ pub struct EarlyStopping {
     min_delta: f32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct ModelConfig {
     pub name: String,
     pub model_type: ModelType,
     shape: (usize, usize),
     target: String,
     target_type: String,
-    unique_values: Vec<String>,
+    unique_values: Option<Vec<String>>,
     train_size: usize,
     test_size: usize,
     validation_size: usize,
@@ -41,6 +42,95 @@ pub struct ModelConfig {
     max_epochs: usize,
     batch_size: usize,
     early_stopping: Option<EarlyStopping>,
+}
+
+impl ModelConfig {
+    pub fn from_json(datahandle: &DataHandle, json: &Value) -> Result<Self, String> {
+        let shape = datahandle.get_shape();
+        let target = datahandle.get_target();
+        let target_type = match json["target_type"].as_str() {
+            Some(target_type) => target_type.to_string(),
+            None => "continuous".to_string(),
+        };
+        let unique_values = match json["unique_values"].as_array() {
+            Some(unique_values) => {
+                let unique_values = unique_values
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>();
+                Some(unique_values)
+            }
+            None => None,
+        };
+        let train_size = match json["train_size"].as_u64() {
+            Some(train_size) => train_size as usize,
+            None => {
+                return Err(format!(
+                    "train_size not specified, given {}",
+                    json["train_size"]
+                ));
+            }
+        };
+        let test_size = match json["test_size"].as_u64() {
+            Some(test_size) => test_size as usize,
+            None => {
+                return Err("test_size not specified".to_string());
+            }
+        };
+        let validation_size = match json["validation_size"].as_u64() {
+            Some(validation_size) => validation_size as usize,
+            None => 0,
+        };
+        let l2_regularization = match json["l2_regularization"].as_f64() {
+            Some(l2_regularization) => l2_regularization as f32,
+            None => 0.0,
+        };
+        let learning_rate = match json["learning_rate"].as_f64() {
+            Some(learning_rate) => learning_rate as f32,
+            None => 0.0,
+        };
+        let max_epochs = match json["max_epochs"].as_u64() {
+            Some(max_epochs) => max_epochs as usize,
+            None => 0,
+        };
+        let batch_size = match json["batch_size"].as_u64() {
+            Some(batch_size) => batch_size as usize,
+            None => 0,
+        };
+        let early_stopping = match json["early_stopping"].as_object() {
+            Some(early_stopping) => {
+                let patience = match early_stopping["patience"].as_u64() {
+                    Some(patience) => patience as usize,
+                    None => 0,
+                };
+                let min_delta = match early_stopping["min_delta"].as_f64() {
+                    Some(min_delta) => min_delta as f32,
+                    None => 0.0,
+                };
+                Some(EarlyStopping {
+                    patience,
+                    min_delta,
+                })
+            }
+            None => None,
+        };
+        Ok(Self {
+            name: json["name"].as_str().unwrap().to_string(),
+            model_type: ModelType::from_str(json["model_type"].as_str().unwrap()).unwrap(),
+            shape,
+            target,
+            target_type,
+            unique_values,
+            train_size,
+            test_size,
+            validation_size,
+            l2_regularization,
+            learning_rate,
+            max_epochs,
+            batch_size,
+            early_stopping,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, PartialOrd)]
@@ -124,6 +214,26 @@ pub enum ModelType {
 impl Default for ModelType {
     fn default() -> Self {
         ModelType::LinearRegression
+    }
+}
+
+impl FromStr for ModelType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Linear Regression" => Ok(ModelType::LinearRegression),
+            "Logistic Regression" => Ok(ModelType::LogisticRegression),
+            "Random Forest" => Ok(ModelType::RandomForest),
+            "Decision Tree" => Ok(ModelType::DecisionTree),
+            "SVM" => Ok(ModelType::SVM),
+            "KNN" => Ok(ModelType::KNN),
+            "KMeans" => Ok(ModelType::KMeans),
+            "PCA" => Ok(ModelType::PCA),
+            "TSNE" => Ok(ModelType::TSNE),
+            "UMAP" => Ok(ModelType::UMAP),
+            _ => Err(()),
+        }
     }
 }
 
@@ -226,9 +336,11 @@ impl Model {
     ) -> Self {
         let state = state.lock().await;
         let id = Uuid::new_v4();
-        create_dir(state.get_path().join(project.to_string()))
-            .await
-            .unwrap();
+        // TODO: handle error
+        match create_dir(state.get_path().join(project.to_string())).await {
+            Ok(_) => {}
+            Err(_) => {}
+        }
         let path = state
             .get_path()
             .join(project.to_string())
@@ -373,7 +485,7 @@ impl DataHandle {
         let mut data_handle = Self::default();
         let file_path = path.join(name);
         if file_path.exists() {
-            return Err("File already exists".to_string());
+            remove_file(&file_path).await.unwrap();
         }
         create_dir_all(&path).await.unwrap();
         tokio::fs::write(&file_path, data).await.unwrap();
@@ -709,7 +821,10 @@ impl AppState {
     }
 
     pub async fn remove_datahandle(&mut self, id: Uuid, hash: &str) {
-        let mut project = self.projects.take(&id).unwrap();
+        let mut project = match self.projects.take(&id) {
+            Some(project) => project,
+            None => return,
+        };
         let data_handle = project.remove_datahandle(hash);
         match data_handle {
             Some(data_handle) => {
