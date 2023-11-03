@@ -92,7 +92,7 @@ async fn main() {
 
     let model = Router::new()
         .route("/", get(get_model).delete(delete_model))
-        .route("/predict", get(model_predict))
+        .route("/predict", post(model_predict))
         .route("/metrics", get(get_model_metrics))
         .route("/file", get(get_model_file));
 
@@ -496,7 +496,8 @@ async fn model_predict(
                     )
                     .unwrap();
                     let res = model.predict(&data);
-                    (StatusCode::OK, Json(serde_json::to_value(res).unwrap()))
+                    let val = serde_json::to_value(res).unwrap();
+                    (StatusCode::OK, Json(json!(val)))
                 }
                 None => (
                     StatusCode::NOT_FOUND,

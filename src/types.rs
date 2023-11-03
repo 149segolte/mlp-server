@@ -185,15 +185,14 @@ impl TrainedModel {
     }
 
     pub fn load(path: &PathBuf) -> Self {
-        let file = File::open(path).unwrap();
+        let file = std::fs::File::open(path.clone()).unwrap();
         let model: TrainedModel = bincode::deserialize_from(file).unwrap();
         model
     }
 
     pub fn save(&self, path: &PathBuf) {
-        let _encoded: Vec<u8> = bincode::serialize(&self).unwrap();
         let mut file = File::create(path.clone()).unwrap();
-        bincode::serialize_into(&mut file, &_encoded).unwrap();
+        bincode::serialize_into(&mut file, self).unwrap();
     }
 }
 
@@ -415,7 +414,6 @@ impl Model {
             "id": self.id.to_string(),
             "name": self.name,
             "model_type": self.model_type.to_string(),
-            "data_hash": self.data_hash,
         })
     }
 
