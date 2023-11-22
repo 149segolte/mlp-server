@@ -5,8 +5,13 @@ use linfa::metrics::SingleTargetRegression;
 use linfa::traits::Fit;
 use linfa::traits::Predict;
 use linfa_linear::{FittedLinearRegression, LinearRegression};
+use linfa_logistic::{FittedLogisticRegression, LogisticRegression};
+use linfa_svm::Svm;
+use linfa_trees::DecisionTree;
+use linfa_trees::DecisionTreeParams;
 use ndarray::{Array1, Array2, Ix1};
 use ndarray_csv::Array2Reader;
+use openssl::symm::Mode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Borrow;
@@ -150,8 +155,32 @@ pub enum Metrics {
     LogisticRegression {
         params: Vec<f32>,
         intercept: f32,
-        train_accuracy: f32,
-        test_accuracy: f32,
+        max_error: f32,
+        mean_absolute_error: f32,
+        mean_squared_error: f32,
+        mean_squared_log_error: f32,
+        median_absolute_error: f32,
+        mean_absolute_percentage_error: f32,
+        r2_score: f32,
+        explained_variance_score: f32,
+    },
+    DecisionTree {
+        params: DecisionTreeParams,
+        precision: f32,
+        recall: f32,
+        f1_score: f32,
+        accurracy: f32,
+        f_score: f32,
+        mcc: f32,
+    },
+    SVM {
+        params: SvmParams,
+        precision: f32,
+        recall: f32,
+        f1_score: f32,
+        accurracy: f32,
+        f_score: f32,
+        mcc: f32,
     },
 }
 
@@ -175,12 +204,22 @@ impl Default for Metrics {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum TrainedModel {
     LinearRegression(FittedLinearRegression<f32>),
+    LogisticRegression(FittedLogisticRegression<f32>),
+    DecisionTree(DecisionTree<f32>),
+    SVM(Svm<f32>),
 }
 
 impl TrainedModel {
     pub fn predict(&self, data: &Array2<f32>) -> Array1<f32> {
         match self {
             TrainedModel::LinearRegression(model) => model.predict(data),
+            TrainedModel::LogisticRegression(model) => model.predict(data),
+            TrainedModel::DecisionTree(model) => model.predict(data),
+            TrainedModel::SVM(model) => model.predict(data),
+            _ => {
+                tracing::error!("Model type not implemented");
+                Array1::zeros(data.nrows())
+            }
         }
     }
 
@@ -260,6 +299,18 @@ impl ModelType {
                 let model = LinearRegression::default().fit(&dataset).unwrap();
                 Some(TrainedModel::LinearRegression(model))
             }
+            ModelType::LogisticRegression => {
+                let model = LogisticRegression::default().fit(&dataset).unwrap();
+                Some(TrainedModel::LogisticRegression(model))
+            }
+            ModelType::DecisionTree => {
+                let model = DecisionTree::params().fit(&dataset).unwrap();
+                Some(TrainedModel::DecisionTree(model))
+            }
+            ModelType::SVM => {
+                let model = Svm::params().fit(&dataset).unwrap();
+                Some(TrainedModel::SVM(model))
+            }
             _ => {
                 tracing::error!("Model type not implemented");
                 None
@@ -272,6 +323,7 @@ impl ModelType {
             ModelType::LinearRegression => {
                 let model = match model {
                     TrainedModel::LinearRegression(model) => model,
+                    _ => unreachable!(),
                 };
                 let predictions = model.predict(&dataset.records);
                 Metrics::LinearRegression {
@@ -288,6 +340,13 @@ impl ModelType {
                     r2_score: dataset.r2(&predictions).unwrap(),
                     explained_variance_score: dataset.explained_variance(&predictions).unwrap(),
                 }
+            }
+            ModelType::LogisticRegression => {
+                let model = match model {
+                    TrainedModel::LogisticRegression(model) => model,
+                    _ => unreachable!(),
+                };
+                let predictions = model.predict(&dataset.records);
             }
             _ => {
                 tracing::error!("Model type not implemented");

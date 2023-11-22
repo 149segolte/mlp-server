@@ -12,8 +12,13 @@ chrono = "0.4.29"
 clap = { version = "4.4.6", features = ["derive"] }
 csv = "1.2.2"
 hyper = { version = "0.14.27", features = ["full"] }
-linfa = { version = "0.6.1", features = ["serde", "ndarray-linalg", "blas", "openblas-system"] }
-linfa-linear = { version = "0.6.1", features = ["ndarray-linalg"] }
+linfa = { version = "0.7.0", features = ["serde", "ndarray-linalg", "blas", "openblas-system"] }
+linfa-clustering = { version = "0.7.0", features = ["ndarray-linalg"] }
+linfa-elasticnet = { version = "0.7.0", features = ["ndarray-linalg"] }
+linfa-linear = { version = "0.7.0", features = ["ndarray-linalg"] }
+linfa-logistic = { version = "0.7.0", features = [] }
+linfa-svm = { version = "0.7.0", features = [] }
+linfa-trees = { version = "0.7.0", features = [] }
 mime_guess = "2.0.4"
 ndarray = { version = "0.15.6", features = ["serde", "rayon", "matrixmultiply-threading", "blas"]}
 ndarray-csv = "0.5.2"
