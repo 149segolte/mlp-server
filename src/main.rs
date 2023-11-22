@@ -54,10 +54,11 @@ async fn main() {
     tokio::spawn(async move {
         let state_clone = state_clone.clone();
         while let Some((id, hash, model_config)) = rx.recv().await {
-            let state = state_clone.lock().await;
+            let mut state = state_clone.lock().await;
             let project = state.get_project(&id).is_some();
             if !project {
                 tracing::error!("Project {} not found", id);
+                state.set_training(&id, &hash, false);
                 continue;
             }
             let datahandle = state
@@ -67,6 +68,7 @@ async fn main() {
                 .is_some();
             if !datahandle {
                 tracing::error!("Datahandle {} not found", hash);
+                state.set_training(&id, &hash, false);
                 continue;
             }
             drop(state);
@@ -74,6 +76,7 @@ async fn main() {
             let model = types::Model::new(state_clone.clone(), id, &hash, model_config).await;
             let mut state = state_clone.lock().await;
             state.add_model(id, model).await;
+            state.set_training(&id, &hash, false);
         }
     });
     //
@@ -86,7 +89,7 @@ async fn main() {
     // build our application with a router
     let data = Router::new()
         .route("/", get(get_datahandle).delete(delete_datahandle))
-        .route("/file", get(get_data))
+        .route("/download", get(get_data))
         .route("/models", get(get_models))
         .route("/add", post(add_model));
 
@@ -94,17 +97,16 @@ async fn main() {
         .route("/", get(get_model).delete(delete_model))
         .route("/predict", post(model_predict))
         .route("/metrics", get(get_model_metrics))
-        .route("/file", get(get_model_file));
+        .route("/download", get(get_model_file));
 
     let project = Router::new()
         .route("/", get(project_info).delete(delete_project))
-        .route("/data", post(upload_data))
-        .nest("/data/:hash", data)
+        .route("/add", post(upload_data))
+        .nest("/file/:hash", data)
         .nest("/model/:model", model);
 
     let app = Router::new()
-        .route("/projects", get(projects_list))
-        .route("/project", post(new_project))
+        .route("/project", get(projects_list).post(new_project))
         .nest("/project/:id", project);
 
     // run it on localhost
@@ -177,7 +179,31 @@ async fn project_info(
                 "name": project.get_name(),
                 "description": project.get_description(),
                 "expires": project.get_expires(),
-                "data": project.get_datahandles().iter().map(|d| d.get_info()).collect::<Vec<_>>()
+                "files": project.get_datahandles().iter().map(|d| {
+                    let info = d.get_info();
+
+                    let models = project
+                        .get_models(&d.get_hash())
+                        .iter()
+                        .map(|model| model.get_info())
+                        .map(|model| {
+                            (model.get("id").unwrap().as_str().unwrap().to_string(), model.get("name").unwrap().as_str().unwrap().to_string())
+                        })
+                        .collect::<Vec<_>>();
+
+                    json!({
+                        "name": info.get("name").unwrap(),
+                        "size": info.get("size").unwrap(),
+                        "content_type": info.get("content_type").unwrap(),
+                        "hash": info.get("hash").unwrap(),
+                        "shape": info.get("shape").unwrap(),
+                        "features": info.get("features").unwrap(),
+                        "target": info.get("target").unwrap(),
+                        "head": info.get("head").unwrap(),
+                        "models": models,
+                        "training": state.get_training(&id, &d.get_hash()),
+                    })
+                }).collect::<Vec<_>>(),
             })),
         ),
         None => (
@@ -207,8 +233,31 @@ async fn get_datahandle(
     match project {
         Some(project) => {
             let data = project.get_datahandle(&hash);
+            let models = project
+                .get_models(&hash)
+                .iter()
+                .map(|model| model.get_info())
+                .map(|model| {
+                    (
+                        model.get("id").unwrap().as_str().unwrap().to_string(),
+                        model.get("name").unwrap().as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let training = state.get_training(&id, &hash);
             match data {
-                Some(data) => (StatusCode::OK, Json(data.get_info())),
+                Some(data) => (StatusCode::OK, Json(json!({
+                    "name": data.get_name(),
+                    "size": data.get_size(),
+                    "content_type": data.get_content_type(),
+                    "hash": data.get_hash(),
+                    "shape": data.get_shape(),
+                    "features": data.get_features(),
+                    "target": data.get_target(),
+                    "head": data.get_head(),
+                    "models": models,
+                    "training": training,
+                }))),
                 None => (
                     StatusCode::NOT_FOUND,
                     Json(json!({ "error": "Data not found" })),
@@ -399,7 +448,7 @@ async fn add_model(
     Path((id, hash)): Path<(Uuid, String)>,
     Json(config): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    let state = state.lock().await;
+    let mut state = state.lock().await;
     let project = state.get_project(&id).is_some();
     if project {
         match state.get_project(&id).unwrap().get_datahandle(&hash) {

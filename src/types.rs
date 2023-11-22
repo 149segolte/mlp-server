@@ -591,7 +591,7 @@ impl DataHandle {
 
     pub fn get_info(&self) -> Value {
         json!({
-            "name": self.get_name(),
+            "name": self.get_name().split(".").next().unwrap(),
             "size": self.get_size(),
             "content_type": self.get_content_type(),
             "hash": self.get_hash(),
@@ -729,6 +729,7 @@ impl Project {
 pub struct AppState {
     server_path: PathBuf,
     projects: HashSet<Project>,
+    training: HashSet<(Uuid, String)>,
     #[serde(skip)]
     tx: Option<tokio::sync::mpsc::Sender<(Uuid, String, ModelConfig)>>,
 }
@@ -779,6 +780,18 @@ impl AppState {
 
     pub fn get_project(&self, id: &Uuid) -> Option<&Project> {
         self.projects.get(id)
+    }
+
+    pub fn get_training(&self, id: &Uuid, hash: &str) -> bool {
+        self.training.contains(&(id.clone(), hash.to_owned()))
+    }
+
+    pub fn set_training(&mut self, id: &Uuid, hash: &str, flag: bool) {
+        if flag {
+            self.training.insert((id.clone(), hash.to_owned()));
+        } else {
+            self.training.remove(&(id.clone(), hash.to_owned()));
+        }
     }
 
     pub async fn add(&mut self, project: Project) -> Uuid {
@@ -836,8 +849,9 @@ impl AppState {
         self.write().await.unwrap();
     }
 
-    pub async fn add_model_queue(&self, id: Uuid, hash: &str, config: ModelConfig) {
+    pub async fn add_model_queue(&mut self, id: Uuid, hash: &str, config: ModelConfig) {
         let tx = self.tx.as_ref().unwrap().clone();
+        self.set_training(&id, hash, true);
         tx.send((id, hash.to_owned(), config)).await.unwrap();
     }
 
@@ -853,7 +867,7 @@ impl AppState {
         let model = project.remove_model(model_id);
         match model {
             Some(model) => {
-                tokio::fs::remove_dir_all(model.get_path()).await.unwrap();
+                tokio::fs::remove_file(model.get_path()).await.unwrap();
             }
             None => {}
         }
