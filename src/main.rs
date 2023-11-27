@@ -1,14 +1,17 @@
+#[macro_use]
+extern crate command_macros;
 use axum::{
     body::StreamBody,
     debug_handler,
-    extract::{Multipart, Path, State},
+    extract::{Path, State},
     http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use chrono::prelude::*;
 use clap::Parser;
+use hyper::body::Bytes;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::fs::create_dir;
@@ -107,6 +110,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/project", get(projects_list).post(new_project))
+        .route("/clean", put(clean_data))
         .nest("/project/:id", project);
 
     // run it on localhost
@@ -166,6 +170,31 @@ async fn new_project(
 }
 
 #[debug_handler]
+async fn clean_data(
+    State(state): State<Arc<Mutex<types::AppState>>>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let mut name = chrono::Utc::now().timestamp_millis().to_string();
+    name.push_str(".json");
+    let file = state.lock().await.get_path().join(name);
+    tokio::fs::write(file.clone(), payload.to_string())
+        .await
+        .unwrap();
+    let script = state
+        .lock()
+        .await
+        .get_path()
+        .join("../scripts/clean_data.py");
+    cmd!(python3(script)(file.to_str().unwrap()))
+        .status()
+        .unwrap();
+    let result = tokio::fs::read_to_string(file.clone()).await.unwrap();
+    tokio::fs::remove_file(file).await.unwrap();
+    let result: Value = serde_json::from_str(result.as_str()).unwrap();
+    (StatusCode::OK, Json(result))
+}
+
+#[debug_handler]
 async fn project_info(
     State(state): State<Arc<Mutex<types::AppState>>>,
     Path(id): Path<Uuid>,
@@ -199,7 +228,11 @@ async fn project_info(
                         "shape": info.get("shape").unwrap(),
                         "features": info.get("features").unwrap(),
                         "target": info.get("target").unwrap(),
+                        "multi_class": info.get("multi_class").unwrap(),
                         "head": info.get("head").unwrap(),
+                        "empty": info.get("empty").unwrap(),
+                        "scale": info.get("scale").unwrap(),
+                        "categorical": info.get("categorical").unwrap(),
                         "models": models,
                         "training": state.get_training(&id, &d.get_hash()),
                     })
@@ -246,18 +279,25 @@ async fn get_datahandle(
                 .collect::<Vec<_>>();
             let training = state.get_training(&id, &hash);
             match data {
-                Some(data) => (StatusCode::OK, Json(json!({
-                    "name": data.get_name(),
-                    "size": data.get_size(),
-                    "content_type": data.get_content_type(),
-                    "hash": data.get_hash(),
-                    "shape": data.get_shape(),
-                    "features": data.get_features(),
-                    "target": data.get_target(),
-                    "head": data.get_head(),
-                    "models": models,
-                    "training": training,
-                }))),
+                Some(data) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "name": data.get_name(),
+                        "size": data.get_size(),
+                        "content_type": data.get_content_type(),
+                        "hash": data.get_hash(),
+                        "shape": data.get_shape(),
+                        "features": data.get_features(),
+                        "target": data.get_target(),
+                        "multi_class": data.get_multi_class(),
+                        "head": data.get_head(),
+                        "empty": data.get_empty(),
+                        "scale": data.get_scale(),
+                        "categorical": data.get_categorical(),
+                        "models": models,
+                        "training": training,
+                    })),
+                ),
                 None => (
                     StatusCode::NOT_FOUND,
                     Json(json!({ "error": "Data not found" })),
@@ -275,85 +315,53 @@ async fn get_datahandle(
 async fn upload_data(
     State(state): State<Arc<Mutex<types::AppState>>>,
     Path(id): Path<Uuid>,
-    mut payload: Multipart,
+    Json(payload): Json<types::Upload>,
 ) -> (StatusCode, Json<Value>) {
-    let mut fields = Vec::new();
-    while let Some(field) = payload.next_field().await.unwrap() {
-        let name = field.name().unwrap_or_default().to_string();
-        if name == "data" {
-            let file_name = field.file_name().unwrap_or_default().to_string();
-            let content_type = field.content_type().unwrap_or_default().to_string();
-            let data = field.bytes().await.unwrap();
-            fields.push((file_name, content_type, data));
-        } else if name == "target" {
-            fields.push((
-                "target".to_string(),
-                "".to_string(),
-                field.bytes().await.unwrap(),
-            ));
-        }
-    }
-    if fields.len() != 2 || fields.iter().find(|field| field.0 == "target").is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Missing data or target" })),
-        );
-    }
+    println!("{:?}", payload);
+    let content = payload.file.content.clone().into_bytes();
+    let data = Bytes::from(content);
 
-    if let Some(file) = fields.iter().find(|field| field.0 != "target") {
-        let name = file.0.clone();
-        let content_type = file.1.clone();
-        let data = file.2.clone();
-
-        let mut state = state.lock().await;
-        let project = state.get_project(&id);
-        match project {
-            Some(project) => {
-                let hash = sha256::digest(data.to_vec());
-                let data_handle = project.get_datahandle(hash.as_str());
-                match data_handle {
-                    Some(_) => (
-                        StatusCode::OK,
-                        Json(json!({ "status": "Already exists", "hash": hash })),
-                    ),
-                    None => {
-                        let target = std::str::from_utf8(
-                            fields
-                                .iter()
-                                .find(|field| field.0 == "target")
-                                .unwrap()
-                                .2
-                                .to_vec()
-                                .as_slice(),
-                        )
-                        .unwrap()
-                        .to_string();
-                        let path = state.get_path().join(id.to_string());
-                        let data_handle =
-                            types::DataHandle::new(path, name, content_type, data, target).await;
-                        match data_handle {
-                            Ok(data_handle) => {
-                                state.add_datahandle(id, data_handle).await;
-                                (StatusCode::CREATED, Json(json!({ "hash": hash })))
-                            }
-                            Err(err) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({ "error": err })),
-                            ),
+    let mut state = state.lock().await;
+    let project = state.get_project(&id);
+    match project {
+        Some(project) => {
+            let hash = sha256::digest(data.to_vec());
+            let data_handle = project.get_datahandle(hash.as_str());
+            match data_handle {
+                Some(_) => (
+                    StatusCode::OK,
+                    Json(json!({ "status": "Already exists", "hash": hash })),
+                ),
+                None => {
+                    let path = state.get_path().join(id.to_string());
+                    let data_handle = types::DataHandle::new(
+                        path,
+                        payload.file.name,
+                        payload.file.content_type,
+                        data,
+                        payload.target,
+                        payload.empty,
+                        payload.scale,
+                        payload.categorical,
+                    )
+                    .await;
+                    match data_handle {
+                        Ok(data_handle) => {
+                            state.add_datahandle(id, data_handle).await;
+                            (StatusCode::CREATED, Json(json!({ "hash": hash })))
                         }
+                        Err(err) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": err })),
+                        ),
                     }
                 }
             }
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "Project not found" })),
-            ),
         }
-    } else {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Invalid number of fields" })),
-        )
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Project not found" })),
+        ),
     }
 }
 
@@ -444,16 +452,56 @@ async fn get_models(
 
 #[debug_handler]
 async fn add_model(
-    State(state): State<Arc<Mutex<types::AppState>>>,
+    State(statehandle): State<Arc<Mutex<types::AppState>>>,
     Path((id, hash)): Path<(Uuid, String)>,
-    Json(config): Json<Value>,
+    Json(mut config): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    let mut state = state.lock().await;
+    let mut state = statehandle.lock().await;
     let project = state.get_project(&id).is_some();
     if project {
         match state.get_project(&id).unwrap().get_datahandle(&hash) {
             Some(datahandle) => {
-                let config = match types::ModelConfig::from_json(datahandle, &config) {
+                let model_id = Uuid::new_v4();
+                let mut name = chrono::Utc::now().timestamp_millis().to_string();
+                name.push_str(".json");
+                let file = state.get_path().join(name);
+                match config {
+                    Value::Object(ref mut map) => {
+                        map.insert("id".to_string(), json!(model_id));
+                        map.insert("project".to_string(), json!(id));
+                        map.insert(
+                            "file".to_string(),
+                            json!(std::fs::canonicalize(datahandle.get_path()).unwrap()),
+                        );
+                        map.insert("target".to_string(), json!(datahandle.get_target()));
+                        map.insert(
+                            "multi_class".to_string(),
+                            json!(datahandle.get_multi_class()),
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                tokio::fs::write(file.clone(), config.to_string())
+                    .await
+                    .unwrap();
+                let script = state.get_path().join("../scripts/train.py");
+                state.set_training(&id, &hash, true);
+                drop(state);
+                cmd!(python3(script)(file.to_str().unwrap()))
+                    .status()
+                    .unwrap();
+                let result = tokio::fs::read_to_string(file.clone()).await.unwrap();
+                tokio::fs::remove_file(file).await.unwrap();
+                let mut state = statehandle.lock().await;
+                state
+                    .add_model2(
+                        hash.as_str(),
+                        serde_json::from_str(result.as_str()).unwrap(),
+                    )
+                    .await;
+                state.set_training(&id, &hash, false);
+                (StatusCode::CREATED, Json(json!({ "id": model_id })))
+                /* let config = match types::ModelConfig::from_json(datahandle, &config) {
                     Ok(config) => config,
                     Err(err) => {
                         return (
@@ -466,7 +514,7 @@ async fn add_model(
                 (
                     StatusCode::CREATED,
                     Json(json!({ "status": "Added to queue" })),
-                )
+                ) */
             }
             None => (
                 StatusCode::NOT_FOUND,
@@ -538,15 +586,8 @@ async fn model_predict(
                             )
                         }
                     };
-                    let data: Vec<Vec<f32>> = serde_json::from_value(input.clone()).unwrap();
-                    let data = ndarray::Array::from_shape_vec(
-                        (data.len(), data[0].len()),
-                        data.into_iter().flatten().collect::<Vec<_>>(),
-                    )
-                    .unwrap();
-                    let res = model.predict(&data);
-                    let val = serde_json::to_value(res).unwrap();
-                    (StatusCode::OK, Json(json!(val)))
+                    let res = model.predict2(input);
+                    (StatusCode::OK, Json(res))
                 }
                 None => (
                     StatusCode::NOT_FOUND,

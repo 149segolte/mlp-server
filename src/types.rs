@@ -199,15 +199,11 @@ impl TrainedModel {
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum ModelType {
     LinearRegression,
+    ElasticNet,
     LogisticRegression,
-    RandomForest,
+    SGD,
     DecisionTree,
     SVM,
-    KNN,
-    KMeans,
-    PCA,
-    TSNE,
-    UMAP,
 }
 
 impl Default for ModelType {
@@ -221,16 +217,12 @@ impl FromStr for ModelType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "Linear Regression" => Ok(ModelType::LinearRegression),
+            "Ordinary Least Squares" => Ok(ModelType::LinearRegression),
+            "Elastic Net" => Ok(ModelType::ElasticNet),
             "Logistic Regression" => Ok(ModelType::LogisticRegression),
-            "Random Forest" => Ok(ModelType::RandomForest),
+            "Gradient Descent" => Ok(ModelType::SGD),
             "Decision Tree" => Ok(ModelType::DecisionTree),
-            "SVM" => Ok(ModelType::SVM),
-            "KNN" => Ok(ModelType::KNN),
-            "KMeans" => Ok(ModelType::KMeans),
-            "PCA" => Ok(ModelType::PCA),
-            "TSNE" => Ok(ModelType::TSNE),
-            "UMAP" => Ok(ModelType::UMAP),
+            "Support Vector Machine" => Ok(ModelType::SVM),
             _ => Err(()),
         }
     }
@@ -240,15 +232,11 @@ impl ToString for ModelType {
     fn to_string(&self) -> String {
         match self {
             ModelType::LinearRegression => "Linear Regression".to_string(),
+            ModelType::ElasticNet => "Elastic Net".to_string(),
             ModelType::LogisticRegression => "Logistic Regression".to_string(),
-            ModelType::RandomForest => "Random Forest".to_string(),
+            ModelType::SGD => "Gradient Descent".to_string(),
             ModelType::DecisionTree => "Decision Tree".to_string(),
-            ModelType::SVM => "SVM".to_string(),
-            ModelType::KNN => "KNN".to_string(),
-            ModelType::KMeans => "KMeans".to_string(),
-            ModelType::PCA => "PCA".to_string(),
-            ModelType::TSNE => "TSNE".to_string(),
-            ModelType::UMAP => "UMAP".to_string(),
+            ModelType::SVM => "Support Vector Machine".to_string(),
         }
     }
 }
@@ -439,6 +427,25 @@ impl Model {
             }
         }
     }
+
+    pub fn predict2(&self, data: &Value) -> Value {
+        let mut script = self.get_path();
+        script.pop();
+        let script = script.join("../../scripts/predict.py");
+        let file = self.get_path();
+        let input = json!({
+            "data": data,
+        }).to_string();
+        let op = cmd!(python3(script)(file.to_str().unwrap())(input))
+            .output()
+            .unwrap();
+        let output = String::from_utf8(op.clone().stdout).unwrap();
+        println!("{:?}", op);
+        let res: Value = serde_json::from_str(&output).unwrap();
+        json!({
+            "data": res,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, Default)]
@@ -451,6 +458,10 @@ pub struct DataHandle {
     shape: (usize, usize),
     features: Vec<String>,
     target: String,
+    multi_class: bool,
+    empty: String,
+    scale: String,
+    categorical: String,
     head: Vec<Vec<String>>,
 }
 
@@ -479,8 +490,14 @@ impl DataHandle {
         content_type: String,
         data: Bytes,
         target: String,
+        empty: String,
+        scale: String,
+        categorical: String,
     ) -> Result<Self, String> {
         let mut data_handle = Self::default();
+        data_handle.empty = empty;
+        data_handle.scale = scale;
+        data_handle.categorical = categorical;
         let file_path = path.join(name);
         if file_path.exists() {
             remove_file(&file_path).await.unwrap();
@@ -537,6 +554,10 @@ impl DataHandle {
                     .map(|(_, c)| c.to_vec().into_iter().collect::<Vec<_>>())
                     .collect::<Vec<_>>();
 
+                let mut temp = targets.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+                temp.sort();
+                temp.dedup();
+                data_handle.multi_class = temp.len() > 2;
                 data_handle.data = data_handle.path.clone();
                 data_handle.data.set_extension("data.bin");
                 data_handle.targets = data_handle.path.clone();
@@ -585,8 +606,24 @@ impl DataHandle {
         self.target.clone()
     }
 
+    pub fn get_multi_class(&self) -> bool {
+        self.multi_class
+    }
+
     pub fn get_head(&self) -> Vec<Vec<String>> {
         self.head.clone()
+    }
+
+    pub fn get_empty(&self) -> String {
+        self.empty.clone()
+    }
+
+    pub fn get_scale(&self) -> String {
+        self.scale.clone()
+    }
+
+    pub fn get_categorical(&self) -> String {
+        self.categorical.clone()
     }
 
     pub fn get_info(&self) -> Value {
@@ -598,7 +635,11 @@ impl DataHandle {
             "shape": self.get_shape(),
             "features": self.get_features(),
             "target": self.get_target(),
+            "multi_class": self.get_multi_class(),
             "head": self.get_head(),
+            "empty": self.get_empty(),
+            "scale": self.get_scale(),
+            "categorical": self.get_categorical(),
         })
     }
 
@@ -862,6 +903,30 @@ impl AppState {
         self.write().await.unwrap();
     }
 
+    pub async fn add_model2(&mut self, hash: &str, conf: Value) {
+        let id: Uuid = conf
+            .get("project")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut project = self.projects.take(&id).unwrap();
+        println!("{:?}", conf);
+        let model = Model {
+            id: conf.get("id").unwrap().as_str().unwrap().parse().unwrap(),
+            name: conf.get("name").unwrap().as_str().unwrap().to_string(),
+            model_type: ModelType::from_str(conf.get("model").unwrap().as_str().unwrap()).unwrap(),
+            data_hash: hash.to_string(),
+            path: PathBuf::from(conf.get("file").unwrap().as_str().unwrap()),
+            config: conf.get("config").unwrap().clone(),
+            metrics: conf.get("metrics").unwrap().clone(),
+        };
+        project.add_model(model);
+        self.projects.insert(project);
+        self.write().await.unwrap();
+    }
+
     pub async fn remove_model(&mut self, id: Uuid, model_id: Uuid) {
         let mut project = self.projects.take(&id).unwrap();
         let model = project.remove_model(model_id);
@@ -874,4 +939,21 @@ impl AppState {
         self.projects.insert(project);
         self.write().await.unwrap();
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct FileHandle {
+    pub name: String,
+    pub content_type: String,
+    pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct Upload {
+    pub name: String,
+    pub target: String,
+    pub empty: String,
+    pub scale: String,
+    pub categorical: String,
+    pub file: FileHandle,
 }
