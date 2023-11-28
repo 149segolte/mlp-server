@@ -18,7 +18,7 @@ linfa-linear = { version = "0.6.1", features = ["ndarray-linalg"] }
 mime_guess = "2.0.4"
 ndarray = { version = "0.15.6", features = ["serde", "rayon", "matrixmultiply-threading", "blas"]}
 ndarray-csv = "0.5.2"
-openssl = "0.10.57"
+openssl = "0.10.60"
 serde = { version = "1.0.188", features = ["std", "derive"] }
 serde_json = "1.0.105"
 sha256 = { version = "1.4.0", features = ["tokio", "native_openssl"] }
