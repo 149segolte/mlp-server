@@ -1,17 +1,16 @@
 use csv::ReaderBuilder;
 use hyper::body::Bytes;
-use linfa::dataset::Dataset;
+use linfa::dataset::{AsSingleTargets, CountedTargets, Dataset, DatasetBase, Labels};
 use linfa::metrics::SingleTargetRegression;
 use linfa::traits::Fit;
 use linfa::traits::Predict;
+use linfa::Label;
 use linfa_linear::{FittedLinearRegression, LinearRegression};
 use linfa_logistic::{FittedLogisticRegression, LogisticRegression};
 use linfa_svm::Svm;
 use linfa_trees::DecisionTree;
-use linfa_trees::DecisionTreeParams;
-use ndarray::{Array1, Array2, Ix1};
+use ndarray::{Array, Array1, Array2, Ix1};
 use ndarray_csv::Array2Reader;
-use openssl::symm::Mode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Borrow;
@@ -139,6 +138,55 @@ impl ModelConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, PartialOrd)]
+pub enum SplitQuality {
+    Gini,
+    Entropy,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, PartialOrd)]
+pub struct DCP {
+    split_quality: SplitQuality,
+    max_depth: usize,
+    min_weight_split: f32,
+    min_weight_leaf: f32,
+    min_impurity_decrease: f32,
+}
+
+impl Default for DCP {
+    fn default() -> Self {
+        DCP {
+            split_quality: SplitQuality::Gini,
+            max_depth: 0,
+            min_weight_split: 0.0,
+            min_weight_leaf: 0.0,
+            min_impurity_decrease: 0.0,
+        }
+    }
+}
+
+impl DCP {
+    pub fn params() -> Self {
+        DCP::default()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, PartialOrd)]
+pub enum KernelMethod {
+    Linear,
+    Polynomial,
+    RBF,
+    Sigmoid,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, PartialOrd)]
+pub struct SP {
+    kernel: KernelMethod,
+    c: (f32, f32),
+    epsilon: f32,
+    shrinking: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, PartialOrd)]
 pub enum Metrics {
     LinearRegression {
         params: Vec<f32>,
@@ -165,7 +213,7 @@ pub enum Metrics {
         explained_variance_score: f32,
     },
     DecisionTree {
-        params: DecisionTreeParams,
+        params: DCP,
         precision: f32,
         recall: f32,
         f1_score: f32,
@@ -174,7 +222,7 @@ pub enum Metrics {
         mcc: f32,
     },
     SVM {
-        params: SvmParams,
+        params: SP,
         precision: f32,
         recall: f32,
         f1_score: f32,
@@ -202,14 +250,14 @@ impl Default for Metrics {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum TrainedModel {
+pub enum TrainedModel<C: Ord + Clone, L: Label> {
     LinearRegression(FittedLinearRegression<f32>),
-    LogisticRegression(FittedLogisticRegression<f32>),
-    DecisionTree(DecisionTree<f32>),
-    SVM(Svm<f32>),
+    LogisticRegression(FittedLogisticRegression<f32, C>),
+    DecisionTree(DecisionTree<f32, L>),
+    SVM(Svm<f32, L>),
 }
 
-impl TrainedModel {
+impl<C: Ord + Clone, L: Label> TrainedModel<C, L> {
     pub fn predict(&self, data: &Array2<f32>) -> Array1<f32> {
         match self {
             TrainedModel::LinearRegression(model) => model.predict(data),
@@ -293,7 +341,10 @@ impl ToString for ModelType {
 }
 
 impl ModelType {
-    pub fn train(&self, dataset: &Dataset<f32, f32, Ix1>) -> Option<TrainedModel> {
+    pub fn train<T: AsSingleTargets + Labels>(
+        &self,
+        dataset: &DatasetBase<Array2<f32>, T>,
+    ) -> Option<TrainedModel> {
         match self {
             ModelType::LinearRegression => {
                 let model = LinearRegression::default().fit(&dataset).unwrap();
@@ -318,7 +369,11 @@ impl ModelType {
         }
     }
 
-    pub fn evaluate(&self, model: &TrainedModel, dataset: &Dataset<f32, f32, Ix1>) -> Metrics {
+    pub fn evaluate<L: Label>(
+        &self,
+        model: &TrainedModel<L>,
+        dataset: &Dataset<f32, f32, Ix1>,
+    ) -> Metrics {
         match self {
             ModelType::LinearRegression => {
                 let model = match model {

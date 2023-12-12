@@ -1247,6 +1247,7 @@ dependencies = [
  "linfa",
  "linfa-clustering",
  "linfa-elasticnet",
+ "linfa-kernel",
  "linfa-linear",
  "linfa-logistic",
  "linfa-svm",

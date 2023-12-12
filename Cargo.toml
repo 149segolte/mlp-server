@@ -15,6 +15,7 @@ hyper = { version = "0.14.27", features = ["full"] }
 linfa = { version = "0.7.0", features = ["serde", "ndarray-linalg", "blas", "openblas-system"] }
 linfa-clustering = { version = "0.7.0", features = ["ndarray-linalg"] }
 linfa-elasticnet = { version = "0.7.0", features = ["ndarray-linalg"] }
+linfa-kernel = "0.7.0"
 linfa-linear = { version = "0.7.0", features = ["ndarray-linalg"] }
 linfa-logistic = { version = "0.7.0", features = [] }
 linfa-svm = { version = "0.7.0", features = [] }
